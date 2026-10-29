@@ -1,0 +1,7 @@
+{
+  "folders": [
+    { "name": "frontend (shared)", "path": "frontend" },
+    { "name": "mysql-backend", "path": "mysql-app/backend" },
+    { "name": "supabase-backend", "path": "supabase-app/backend" }
+  ]
+}
