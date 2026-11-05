@@ -5,3 +5,8 @@ node_modules
 .env.*.local
 .DS_Store
 supabase-source
+
+# Local database backups - do not upload to GitHub
+supabase_backup.sql
+supabase-app/backend/backup.sql
+

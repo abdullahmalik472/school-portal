@@ -44,3 +44,5 @@ export async function api(path, { token, body, method = 'GET', backend } = {}) {
     return { ok: false, data: { error: `Cannot reach the ${BACKENDS[key].label} backend (${base}). Is it running?` } }
   }
 }
+
+// Fetch active organizations from the currently selected backend.

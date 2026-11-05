@@ -1,10 +1,7 @@
-// The ONLY file that knows about MySQL. Routes just call these functions.
+
 const mysql = require('mysql2/promise')
 
-// Cloud databases (Aiven etc.) only accept encrypted connections. Local MySQL needs none of this.
-//   DB_CA=<certificate text>  -> encrypted AND the server's identity is verified (best)
-//   DB_SSL=true               -> encrypted, certificate not verified (quick way to get started)
-//   neither set               -> plain connection, exactly as before (your local MySQL, Railway private network)
+// Database SSL configuration
 const ssl = process.env.DB_CA
   ? { ca: process.env.DB_CA.replace(/\\n/g, '\n') }
   : process.env.DB_SSL === 'true'
@@ -20,53 +17,299 @@ const pool = mysql.createPool({
   ssl,
 })
 
-// Test the connection once at startup so problems show up immediately in the logs
+// Temporary database diagnostics
+async function checkDatabase() {
+  try {
+    const [identity] = await pool.query(`
+      SELECT @@hostname AS hostname,
+             @@port AS port,
+             DATABASE() AS database_name,
+             VERSION() AS version
+    `)
+
+    console.log('BACKEND DATABASE:', identity[0])
+
+    const [constraints] = await pool.query(`
+      SELECT CONSTRAINT_NAME, CHECK_CLAUSE
+      FROM information_schema.CHECK_CONSTRAINTS
+      WHERE CONSTRAINT_SCHEMA = DATABASE()
+    `)
+
+    console.log('BACKEND CHECK CONSTRAINTS:', constraints)
+
+    const [table] = await pool.query('SHOW CREATE TABLE users')
+
+    console.log('BACKEND USERS TABLE:', table[0])
+  } catch (error) {
+    console.error('DATABASE DIAGNOSTIC ERROR:', error)
+  }
+}
+
+checkDatabase()
+
 pool.query('SELECT 1').then(
-  () => console.log(`MySQL connected (${process.env.DB_HOST}:${process.env.DB_PORT || 3306}/${process.env.DB_NAME})`),
-  (err) => console.error(`!! MySQL connection FAILED: ${err.code} - ${err.message}`)
+  () => console.log(
+    `MySQL connected (${process.env.DB_HOST}:${process.env.DB_PORT || 3306}/${process.env.DB_NAME})`
+  ),
+  (err) => console.error(
+    `!! MySQL connection FAILED: ${err.code} - ${err.message}`
+  )
 )
 
-const all = async (sql, params) => (await pool.query(sql, params))[0]
-const one = async (sql, params) => (await all(sql, params))[0]
+const all = async (sql, params = []) =>
+  (await pool.query(sql, params))[0]
+
+const one = async (sql, params = []) =>
+  (await all(sql, params))[0]
 
 module.exports = {
-  findUserByEmail: (email) => one('SELECT * FROM users WHERE email = ?', [email]),
-  findUserById: (id) => one('SELECT * FROM users WHERE id = ?', [id]),
-  listUsers: () => all('SELECT id, name, email, role, created_at FROM users ORDER BY id'),
+  // Find one user by email
+  findUserByEmail: (email) =>
+    one(`
+      SELECT
+        u.*,
+        o.name AS organization_name,
+        o.code AS organization_code
+      FROM users u
+      LEFT JOIN organizations o ON o.id = u.organization_id
+      WHERE u.email = ?
+    `, [email]),
 
-  async createUser(user) {
-    const [result] = await pool.query('INSERT INTO users SET ?', user)
-    return { id: result.insertId, ...user }
+  // Find all accounts belonging to an email
+  findUsersByEmail: (email) =>
+    all(`
+      SELECT
+        u.*,
+        o.name AS organization_name,
+        o.code AS organization_code
+      FROM users u
+      LEFT JOIN organizations o ON o.id = u.organization_id
+      WHERE u.email = ?
+      ORDER BY u.id
+    `, [email]),
+
+  // Find organizations belonging to an email
+  listOrganizationsForEmail: (email) =>
+    all(`
+      SELECT DISTINCT
+        o.id,
+        o.name,
+        o.code
+      FROM users u
+      INNER JOIN organizations o ON o.id = u.organization_id
+      WHERE u.email = ?
+      ORDER BY o.name
+    `, [email]),
+
+  // Find user by ID
+  findUserById: (id) =>
+    one(`
+      SELECT
+        u.*,
+        o.name AS organization_name,
+        o.code AS organization_code
+      FROM users u
+      LEFT JOIN organizations o ON o.id = u.organization_id
+      WHERE u.id = ?
+    `, [id]),
+
+  // List users with organization details
+  listUsers: () =>
+    all(`
+      SELECT
+        u.id,
+        u.organization_id,
+        u.reg_id,
+        u.name,
+        u.email,
+        u.role,
+        u.created_at,
+        o.name AS organization_name,
+        o.code AS organization_code
+      FROM users u
+      LEFT JOIN organizations o
+        ON o.id = u.organization_id
+      ORDER BY u.id
+    `),
+
+  // List organizations
+  listOrganizations: () =>
+    all(`
+      SELECT id, name, code, is_active
+      FROM organizations
+      ORDER BY name
+    `),
+
+  // Create organization
+  async createOrganization({ code, name }) {
+    const cleanCode = String(code).trim().toUpperCase()
+    const cleanName = String(name).trim()
+
+    if (!/^[A-Z0-9]{2,6}$/.test(cleanCode)) {
+      throw new Error('Organization code must be 2-6 letters or numbers')
+    }
+
+    if (!cleanName) {
+      throw new Error('Organization name is required')
+    }
+
+    const [result] = await pool.query(
+      `INSERT INTO organizations (code, name) VALUES (?, ?)`,
+      [cleanCode, cleanName]
+    )
+
+    return {
+      id: result.insertId,
+      code: cleanCode,
+      name: cleanName,
+    }
   },
 
+  // Create user and generate organization-based registration ID
+  async createUser(user) {
+    const connection = await pool.getConnection()
+
+    try {
+      await connection.beginTransaction()
+
+      const {
+        name,
+        email,
+        password_hash,
+        role,
+        organization_id,
+      } = user
+
+      if (!['student', 'teacher', 'admin'].includes(role)) {
+        throw new Error('Invalid user role')
+      }
+
+      if (!organization_id) {
+        throw new Error('Please select an organization')
+      }
+
+      // Lock organization row to prevent duplicate serial numbers
+      const [organizations] = await connection.query(
+        `SELECT id, code, student_seq, teacher_seq, is_active
+         FROM organizations
+         WHERE id = ?
+         FOR UPDATE`,
+        [organization_id]
+      )
+
+      const organization = organizations[0]
+
+      if (!organization || !organization.is_active) {
+        throw new Error('Invalid or inactive organization')
+      }
+
+      let reg_id = null
+
+      if (role === 'student') {
+        const next = organization.student_seq + 1
+
+        reg_id = `${organization.code}${String(next).padStart(3, '0')}`
+
+        await connection.query(
+          `UPDATE organizations
+           SET student_seq = ?
+           WHERE id = ?`,
+          [next, organization.id]
+        )
+      }
+
+      if (role === 'teacher') {
+        const next = organization.teacher_seq + 1
+
+        reg_id = `${organization.code}-T${String(next).padStart(3, '0')}`
+
+        await connection.query(
+          `UPDATE organizations
+           SET teacher_seq = ?
+           WHERE id = ?`,
+          [next, organization.id]
+        )
+      }
+
+      const newUser = {
+        organization_id: organization.id,
+        reg_id,
+        name,
+        email,
+        password_hash,
+        role,
+      }
+
+      const [result] = await connection.query(
+        'INSERT INTO users SET ?',
+        [newUser]
+      )
+
+      await connection.commit()
+
+      return {
+        id: result.insertId,
+        ...newUser,
+      }
+    } catch (error) {
+      await connection.rollback()
+      throw error
+    } finally {
+      connection.release()
+    }
+  },
+
+  // Courses
   listCourses: () =>
-    all(`SELECT c.id, c.title, u.name AS teacher
-         FROM courses c JOIN users u ON u.id = c.teacher_id
-         ORDER BY c.id DESC`),
+    all(`
+      SELECT c.id, c.title, u.name AS teacher
+      FROM courses c
+      JOIN users u ON u.id = c.teacher_id
+      ORDER BY c.id DESC
+    `),
 
   async createCourse(course) {
-    const [result] = await pool.query('INSERT INTO courses SET ?', course)
+    const [result] = await pool.query(
+      'INSERT INTO courses SET ?',
+      course
+    )
+
     return { id: result.insertId, ...course }
   },
 
-  // --- used by the MySQL -> Supabase sync (no ids: Supabase makes its own; email / mysql_id link the rows)
+  // MySQL -> Supabase sync
   listAllUsers: () =>
-    all('SELECT name, email, password_hash, role, created_at FROM users ORDER BY id'),
+    all(`
+      SELECT name, email, password_hash, role, created_at
+      FROM users
+      ORDER BY id
+    `),
 
   listAllCourses: () =>
-    all(`SELECT c.id, c.title, c.created_at, u.email AS teacher_email
-         FROM courses c JOIN users u ON u.id = c.teacher_id
-         ORDER BY c.id`),
+    all(`
+      SELECT c.id, c.title, c.created_at,
+             u.email AS teacher_email
+      FROM courses c
+      JOIN users u ON u.id = c.teacher_id
+      ORDER BY c.id
+    `),
 
-  // --- used by the scheduled report (NOW() is the database's own clock, so no timezone mix-ups)
+  // Scheduled reports
   listStudentsSince: (minutes) =>
-    all(`SELECT id, name, email, created_at FROM users
-         WHERE role = 'student' AND created_at >= NOW() - INTERVAL ? MINUTE
-         ORDER BY id`, [minutes]),
+    all(`
+      SELECT id, name, email, created_at
+      FROM users
+      WHERE role = 'student'
+        AND created_at >= NOW() - INTERVAL ? MINUTE
+      ORDER BY id
+    `, [minutes]),
 
   listCoursesSince: (minutes) =>
-    all(`SELECT c.id, c.title, u.name AS teacher, c.created_at
-         FROM courses c JOIN users u ON u.id = c.teacher_id
-         WHERE c.created_at >= NOW() - INTERVAL ? MINUTE
-         ORDER BY c.id`, [minutes]),
+    all(`
+      SELECT c.id, c.title, u.name AS teacher, c.created_at
+      FROM courses c
+      JOIN users u ON u.id = c.teacher_id
+      WHERE c.created_at >= NOW() - INTERVAL ? MINUTE
+      ORDER BY c.id
+    `, [minutes]),
 }
